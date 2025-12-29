@@ -92,19 +92,28 @@
             color: brown;
             opacity: 0.90;
             text-decoration: none;
+            margin: 1rem 0 0 0;
+        }
+
+        .post-divider {
+            border: none;
+            height: 1px;
+            background: color-mix(in hsl, canvasText, transparent 50%);
+            margin: 1rem 0 ;
+            opacity: 0.6;
         }
 
         .blog-content p {
             line-height: 1.6;
-            margin: 0 0 1.5rem 0;
+            margin: 0 0 1.0rem 0;
             font-size: 1rem;
             opacity: 0.85;
             font-weight: 400;
         }
 
         .blog-content h2 {
-            font-size: 1.35rem;
-            margin: 2.5rem 0 1rem 0;
+            font-size: 1.5rem;
+            margin: 3rem 0 1rem 0;
             font-weight: 600;
         }
 
@@ -115,35 +124,80 @@
         }
 
         .blog-content h4 {
-            font-size: 1rem;
-            margin: 1.5rem 0 0.5rem 0;
-            font-weight: 600;
+            font-size: 0.95rem;
+            margin: 2rem 0 0.5rem 0;
+            font-weight: 500;
+            font-family: 'Inter', system-ui;
+            color: green;
+            opacity: 0.85;
+            border-left: 3px solid green;
+            padding-left: 0.75rem;
         }
 
         .blog-content code {
-            background: color-mix(in hsl, canvas, canvasText 10%);
-            padding: 0.2rem 0.4rem;
-            border-radius: 4px;
-            font-family: 'Monaco', monospace;
-            font-size: 0.9em;
+            color: brown;
+            border: 1px solid rgba(128, 128, 128, 0.4);
+            opacity: 0.9;
+            padding: 0.5rem;
+            border-radius: 6px;
+            font-family: 'Inter', system-ui;
+            font-size: 0.95em;
+            line-height: 1.6;
+            display: inline-block;
+        }
+
+        .blog-content pre code {
+            display: block;  /* ← ADD THIS */
+            border: none;     /* Remove duplicate border */
+            padding: 0;       /* Remove duplicate padding (pre already has padding) */
+        }
+
+        .blog-content > code {
+            display: block;
+            margin: 1.5rem 0;
         }
 
         .blog-content pre {
-            background: #f5f5f0;
+            position: relative;
             padding: 1rem;
             border-radius: 8px;
             overflow-x: auto;
             margin: 1.5rem 0;
-            font-family: 'Monaco', monospace;
+            font-family: 'Inter', system-ui;
             font-size: 0.875rem;
             line-height: 1.5;
-            border: 2px solid #8b7355;
-            color: #666;
+            border: 1px solid rgba(139, 115, 85, 0.35);
+            color: rgba(0, 0, 0, 0.65);
         }
 
-        .blog-content pre code {
-            background: none;
-            padding: 0;
+        .blog-content pre::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: hsl(40, 30%, 95%);
+            border-radius: inherit;
+            z-index: -1;
+        }
+
+        .blog-figure {
+            margin: 2.5rem 0;
+            text-align: center;
+        }
+
+        .blog-image {
+            display: block;
+            max-width: 100%;
+            margin: 0 auto;
+            padding: 0.75rem;
+            background: hsl(40, 30%, 96%);
+            border: 1px solid rgba(139, 115, 85, 0.25);
+            border-radius: 10px;
+        }
+
+        .blog-figure figcaption {
+            margin-top: 0.6rem;
+            font-size: 0.9rem;
+            opacity: 0.7;
         }
 
         .blog-content ul,
@@ -221,8 +275,519 @@
             </div>
         </header>
 
+        <hr class="post-divider">
+
         <div class="blog-content">
+            <p>
+                I have long made use of PyTorch, yet until now I had never truly paused to ask what lies beneath this vast and weighty library of tensors. 
+                I know I am not alone in this; indeed, most who use it walk the same road. 
+                And so, I resolved to turn back, to look beneath the surface, and to write down, step by step, what I come to understand of PyTorch’s inner workings.
+            </p>
+
+            <p>
+                Let us begin our walk with <em>torch.empty</em>, the first stop in this series on PyTorch. 
+                Here we shall look closely at how tensors come into being, and how they are held in memory. 
+                PyTorch offers many kinds of tensors — empty, ones, zeros, and more — but to chase them all at once would only cloud the mind. 
+                For the sake of clarity, I cast a simple coin and chose one path to follow. 
+                That path, for now, is <em>torch.empty</em>.
+            </p>
+
+            <code>
+                | All code references in this post correspond to PyTorch commit 17a2688dd52 on the main branch.
+            </code>
+
+            <p>
+                Before we set foot upon this path, there is one matter of great importance that must be understood. 
+                If you clone the repository and search in earnest for the function <em>torch.empty()</em>, you will find nothing at all. 
+                Truly, it is nowhere to be seen. This is not an oversight. 
+                PyTorch does not write this function plainly in Python within the repository; instead, it is brought into being during the build itself. 
+                Only after the code is built, and you search once more, will the function reveal itself.
+            </p>
+
+            <p>
+                The reason for this choice likely lies in efficiency, and in PyTorch’s careful and elaborate process of code generation, known as <em>torchgen</em>. 
+                To explain this machinery in full, and to trace the exact path from definition to the final Python function, would demand an article of its own. 
+                For now, consider this a gentle warning to the reader. I shall offer only a small glimpse of this process below, before we turn our attention to the C++ implementation itself.
+            </p>
+
+            <h2>1. The Declaration: native_functions.yaml</h2>
+            <p>
+                We have already said that the Python functions we use each day are not written by hand, but are instead formed during the build process. 
+                Yet this raises a fair question: such functions must first be declared somewhere. 
+                They cannot arise from nothing. That place is a file named <strong style="color: brown;">native_functions.yaml</strong>
+            </p>
+
+            <p>
+                This file is vast, almost daunting at first sight, stretching to a little over sixteen thousand lines. 
+                It lives at <em>pytorch/aten/src/ATen/native/native_functions.yaml</em>, and within it lies the written record of many operations that PyTorch knows how to perform.
+            </p>
+
+            <p>
+                If you search this file for the word <em>empty</em>, you will find more than one match. 
+                This is curious at first, and perhaps confusing. Which of these, then, is the one we seek? 
+                The answer is the function named <em>empty.memory_format()</em>.
+            </p>
+
+            <figure class="blog-figure">
+                <img
+                    src="https://r2-image-worker.mohansuresh333.workers.dev/src/images/torch_empty_doc.png"
+                    alt="torch.empty documentation showing the public function signature"
+                    class="blog-image"
+                />
+                <figcaption>
+                    The public <em>torch.empty</em> documentation.  
+                </figcaption>
+            </figure>
+
+            <p>
+                The documentation makes this clear, and as we shall see below, the definition in <em>native_functions.yaml</em> matches it exactly.
+            </p>
+
+            <p>
+                The other functions that bear the name <em>empty</em> serve different purposes: 
+                some exist for named tensors, others for manual strides, and still others for cases where memory has already been set aside in advance. 
+                These paths are important in their own right, but they are not the path we shall walk today. 
+                For now, we set them aside and keep our attention on a single door.
+            </p>
+
+
+            <h4>empty.memory_format()</h4>
+            <pre><code>
+- func: empty.memory_format(
+    SymInt[] size,
+    *,
+    ScalarType? dtype=None,
+    Layout? layout=None,
+    Device? device=None,
+    bool? pin_memory=None,
+    MemoryFormat? memory_format=None
+  ) -&gt; Tensor
+  dispatch:
+    CPU: empty_cpu
+    CUDA: empty_cuda
+    MPS: empty_mps
+    Meta: empty_meta_symint
+    MkldnnCPU: empty_mkldnn
+    SparseCPU, SparseCUDA, SparseMPS: empty_sparse
+    SparseMeta: empty_sparse_symint
+    SparseCsrCPU, SparseCsrCUDA: empty_sparse_compressed
+    SparseCsrMeta: empty_sparse_compressed_symint
+            </code></pre>
+            <p>
+                Let us now look more closely at how <em>empty.memory_format()</em> is written in this file. 
+                At first glance, the definition may seem dense, but it follows a clear and deliberate structure.
+            </p>
+
+            <p>
+                The <strong style="color: brown;">function name</strong> itself follows a simple pattern: <em>&lt;name&gt;.&lt;variant&gt;</em>. 
+                Here, <em>empty</em> is the base operation, while <em>memory_format</em> marks a specific variant. 
+                PyTorch often defines several such variants for a single operation, such as <em>empty.names</em> or <em>empty.out</em>. 
+                This system allows different interfaces to exist side by side, while still sharing the same underlying ideas and, in many cases, the same implementation.
+            </p>
+
+            <p>
+                The <strong style="color: brown;">parameters</strong> of this function are divided with care. 
+                The first argument, <em>SymInt[] size</em>, describes the shape of the tensor. 
+                These are symbolic integers, which means the size may be known only at runtime, as is common in compiled or traced code paths. 
+                After this comes the asterisk, a quiet but important marker, telling us that everything that follows must be passed by keyword.
+            </p>
+
+            <p>
+                These <strong style="color: brown;">keyword-only</strong> arguments control the finer details of tensor creation: the scalar type, the layout, the target device, whether memory should be pinned, and finally the desired memory format.
+                Each of these is optional, allowing PyTorch to choose sensible defaults when the user does not specify them.
+            </p>
+
+            <p>
+                The <strong style="color: brown;">return type</strong> is simple. This function yields a single tensor. 
+                Some operations in PyTorch return multiple values, but <em>empty.memory_format()</em> does not. 
+                It exists for one purpose only: to produce a tensor of the requested shape and properties.
+            </p>
+
+            <p>
+                Below the function signature lies the <strong style="color: brown;">dispatch table</strong>, and it is here that the real work begins. 
+                This table maps different execution contexts to their corresponding C++ implementations. 
+                When you call <em>torch.empty</em> on the CPU, on a CUDA device, or on Apple’s MPS backend, the dispatcher examines the arguments, selects the appropriate dispatch key, and forwards the call to the correct kernel.
+            </p>
+
+            <p>
+                In this way, PyTorch presents a single, calm Python interface, while hiding a great deal of complexity beneath it. 
+                The same call can create a tensor on the CPU, on a GPU, or even on a meta device used only for shape inference, all without the user needing to change their code.
+            </p>
+
+            <p>
+                There are other <em>empty</em> variants defined in this file, and the curious reader may wish to glance at them.
+                We will not follow those paths here, as they would lead us away from the story we are telling.
+            </p>
+
+            <p>
+                For now, it is enough to note one simple fact. 
+                From the dispatch table, we can see that the CPU path leads to a function named <strong style="color: brown;">empty_cpu</strong>
+                That is where we shall go next. One might ask why we do not begin with CUDA, since it is so central to modern deep learning. 
+                The answer is simple. We are walking, not running. And so, as with many things, we begin with the CPU.
+            </p>
+
+            <figure class="blog-figure">
+                <img
+                    src="https://r2-image-worker.mohansuresh333.workers.dev/src/images/inside_pytorch-1.png"
+                    alt="How torch.empty is dispatched from the Python API to backend implementations"
+                    class="blog-image"
+                />
+                <figcaption>
+                    The path taken by <em>torch.empty</em>, from its Python entry point to backend-specific kernels.
+                </figcaption>
+            </figure>
+
+            <h2>2. The CPU Path: Following empty_cpu</h2>
+
+            <p>
+                Before we step into the implementation of empty_cpu, there is a small question to answer: where is it actually defined?
+            </p>
+
+            <p>
+                If you clone the PyTorch repository and simply search for <strong>empty_cpu</strong> , you will quickly be flooded with results. Declarations in headers, references in generated code, and entries in configuration files all appear at once. At first glance, it is not obvious which of these contains the real backend logic.
+            </p>
+
+            <p>
+                The key to resolving this lies in namespaces. In <strong>native_functions.yaml</strong>, we saw that the CPU dispatch points to a symbol named <em>empty_cpu</em>. But in C++, such names rarely live in the global scope.
+            </p>
+
+            <p>
+                Although we are setting aside the deeper details of PyTorch’s code generation machinery for now, there is one rule that matters here. The default kernel namespace is <em>at::native</em>. This is not a guess; it is written directly into the code that drives generation.
+            </p>
+
+             <code>
+            torchgen/model.py<br>
+            <strong style="color: green;">60</strong>: DEFAULT_KERNEL_NAMESPACE = "at::native"
+            </code>
+
+            <p>
+                With this in mind, the name <strong>empty_cpu</strong> from the YAML file expands naturally into <em>at::native::empty_cpu</em>. Once we search within that namespace, the noise falls away.
+            </p>
+           
+            <p>
+                Following this trail leads us straight to <em>aten/src/ATen/native/TensorFactories.cpp</em>. There, wrapped inside the expected namespace, we find the function we have been seeking.
+            </p>
+
+            <p>
+                Now that we know where empty_cpu lives, we can finally turn our attention to what it does. From here on, the discussion becomes concrete, as we begin to see how PyTorch allocates memory on the CPU.
+            </p>
+
+            <h4>at::native::empty_cpu in TensorProperties.cpp</h4>
             
+            <p> The full source is shown below for the curious reader who wishes to look a little closer.</p>
+
+            <pre><code>
+Tensor empty_cpu(
+    IntArrayRef size,
+    std::optional&lt;ScalarType&gt; dtype_opt,
+    std::optional&lt;Layout&gt; layout_opt,
+    std::optional&lt;Device&gt; device_opt,
+    std::optional&lt;bool&gt; pin_memory_opt,
+    std::optional&lt;c10::MemoryFormat&gt; memory_format_opt) {
+  Tensor result = at::detail::empty_cpu(
+      size,
+      dtype_opt,
+      layout_opt,
+      device_opt,
+      pin_memory_opt,
+      memory_format_opt);
+  // See Note [Enabling Deterministic Operations]
+  if (C10_UNLIKELY(
+          at::globalContext().deterministicAlgorithms() &&
+          at::globalContext().deterministicFillUninitializedMemory())) {
+    fill_empty_deterministic_(result);
+  }
+  return result;
+}
+</code></pre>
+
+            <p>At first sight, this function mirrors what we saw earlier in <em>native_functions.yaml</em>. 
+            The parameters line up one for one: the tensor size, followed by a sequence of optional arguments for data type, layout, device, pinned memory, and memory format. 
+            In C++, these optional values are represented using <em>std::optional</em>, reflecting the same flexibility exposed at the Python level.</p>
+
+            <p>The return type is a single <em>Tensor</em>, just as the YAML definition promised. 
+            There is no extra logic here to construct or modify the tensor directly. Instead, this function serves as a thin wrapper.</p>
+
+            <p>The actual allocation work is delegated to <em>at::detail::empty_cpu</em>, which lives one layer deeper in the implementation. 
+            There is also a small conditional block related to deterministic behavior. We will set that aside for now and return to it later, once the main allocation path is clear.</p>
+
+            <p>With that, our path forward is obvious. To understand how memory is truly allocated on the CPU, we must now step into the <em>detail</em> namespace and examine <em>empty_cpu</em> there.</p>
+
+            <h4>at::detail::empty_cpu in EmptyTensor.cpp(primary)</h4>
+
+            <p>If you now search for <em>empty_cpu</em> inside the <em>detail</em> namespace, you will find more than one definition. 
+            In fact, in <em>aten/src/ATen/EmptyTensor.cpp</em>, there are three functions that share this name.</p>
+            
+            <pre><code>
+TensorBase empty_cpu(
+    IntArrayRef size,
+    std::optional&lt;ScalarType&gt; dtype_opt,
+    std::optional&lt;Layout&gt; layout_opt,
+    std::optional&lt;Device&gt; device_opt,
+    std::optional&lt;bool&gt; pin_memory_opt,
+    std::optional&lt;c10::MemoryFormat&gt; memory_format_opt) {
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(device_or_default(device_opt).type() == DeviceType::CPU);
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(layout_or_default(layout_opt) == Layout::Strided);
+
+  auto pin_memory = pinned_memory_or_default(pin_memory_opt);
+  auto dtype = dtype_or_default(dtype_opt);
+  return empty_cpu(size, dtype, pin_memory, memory_format_opt);
+}
+</code></pre>
+            
+            <p>So which one is ours? The answer lies, once again, in the function signature. 
+            The version shown above accepts the same set of parameters that the <em>at::native::empty_cpu</em> wrapper passes along. 
+            The other overloads take different arguments and therefore cannot be the target of this call.</p>
+
+            <p>With that match established, the structure of this function becomes clear. 
+            The <em>size</em> argument is required, just as it was before, while the remaining parameters are optional. 
+            Two debug-only assertions follow. These checks confirm that the device is indeed the CPU, and that the layout is strided. 
+            Both conditions are expected here, but the assertions serve as a safeguard during development.</p>
+
+            <p>After this brief validation, the function sheds the optional wrappers, resolves defaults where needed, and forwards the call once more. 
+            Only the essential pieces remain: the size, the data type, the pinned-memory flag, and the memory format.</p>
+
+            <p>And so the path continues. To see where memory is actually reserved, we must now follow this final call to the next <em>empty_cpu</em> below.</p>
+
+            <h4>at::detail::empty_cpu in EmptyTensor.cpp(secondary)</h4>
+            <p>At this point, the layers of indirection begin to fall away. 
+            The function signature is simpler now. All optional arguments have been resolved, and only the essentials remain: the tensor size, the scalar type, whether memory should be pinned, and the requested memory format.</p>
+
+            <pre><code>
+TensorBase empty_cpu(
+    IntArrayRef size,
+    ScalarType dtype,
+    bool pin_memory,
+    std::optional&lt;c10::MemoryFormat&gt; memory_format_opt) {
+  auto allocator = GetCPUAllocatorMaybePinned(pin_memory);
+  constexpr c10::DispatchKeySet cpu_ks(c10::DispatchKey::CPU);
+  return empty_generic(size, allocator, cpu_ks, dtype, memory_format_opt);
+}
+</code></pre>
+
+            <p>
+            The first line selects an allocator. The choice depends on the <em>pin_memory</em> flag. 
+            If pinned memory is requested, a specialized allocator is used; otherwise, the standard CPU allocator is chosen. 
+            We will return to the allocator itself shortly.
+            </p>
+
+            <p>
+            Next, a dispatch key set is constructed. Here it contains only a single key, <em>CPU</em>. 
+            This value records the backend context in which the tensor will live and will travel with the tensor as it moves through the system.
+            </p>
+
+            <p>
+            With these pieces in hand, the function delegates once more. 
+            The actual work is passed to <em>empty_generic</em>, along with the size, allocator, dispatch key set, data type, and memory format.
+            </p>
+
+            <p>
+            Rather than detouring into the side details just yet, we will follow the main path. 
+            To understand how a tensor is truly created, we must first step into <em>empty_generic</em>. 
+            Only after that will it make sense to return and examine how the allocator and dispatch keys shape the result.
+            </p>
+
+            <h4>at::detail::empty_generic in EmptyTensor.cpp</h4>
+            
+            <p>If you search for <em>empty_generic</em> in the codebase, you will find two definitions. 
+            One is intended for symbolic shapes, used when sizes are not concrete at runtime. That path is not our concern here.</p>
+
+            <pre><code>
+TensorBase empty_generic(
+    IntArrayRef size,
+    c10::Allocator* allocator,
+    c10::DispatchKeySet ks,
+    ScalarType scalar_type,
+    std::optional&lt;c10::MemoryFormat&gt; memory_format_opt) {
+  return _empty_generic(size, allocator, ks, scalar_type, memory_format_opt);
+}
+</code></pre>
+
+            <p>The version shown above is the one reached from <em>empty_cpu</em>. 
+            Its role is modest and precise. It accepts exactly the arguments prepared in the previous step: the size, allocator, dispatch key set, scalar type, and memory format.</p>
+
+            <p>There is no additional logic here. This function exists mainly as a thin wrapper, forwarding everything directly to <em>_empty_generic</em>.</p>
+
+            <p>And so the trail continues. To see where memory is finally allocated and a tensor is truly brought into being, we must now step into <em>_empty_generic</em> itself.</p>
+
+            <h4>at::detail::_empty_generic in EmptyTensor.cpp</h4>
+
+            <p>This is the point at which all the earlier preparation finally comes together. 
+            Here, the tensor is no longer an abstract idea passed along through layers of wrappers. 
+            Memory is sized, storage is created, and a concrete tensor object begins to take shape.</p>
+
+            <pre><code>
+static TensorBase _empty_generic(
+    ArrayRef&lt;T&gt; size,
+    c10::Allocator* allocator,
+    c10::DispatchKeySet ks,
+    ScalarType scalar_type,
+    std::optional&lt;c10::MemoryFormat&gt; memory_format_opt) {
+  at::detail::check_size_nonnegative(size);
+  at::detail::raise_warning_for_complex_half(scalar_type);
+  caffe2::TypeMeta dtype = scalarTypeToTypeMeta(scalar_type);
+  auto size_bytes = computeStorageNbytesContiguous(size, dtype.itemsize());
+
+  auto storage_impl = c10::make_intrusive&lt;StorageImpl&gt;(
+      c10::StorageImpl::use_byte_size_t(),
+      size_bytes,
+      allocator,
+      /*resizeable=*/true);
+
+  auto tensor = detail::make_tensor_base&lt;TensorImpl&gt;(
+      std::move(storage_impl), ks, dtype);
+
+  // Default TensorImpl has size [0]
+  if (ks.has(c10::DispatchKey::Meta) || size.size() != 1 || size[0] != 0) {
+    tensor.unsafeGetTensorImpl()
+        ->generic_set_sizes_contiguous(size);
+  }
+
+  if (memory_format_opt.has_value()) {
+    if (*memory_format_opt != MemoryFormat::Contiguous) {
+      tensor.unsafeGetTensorImpl()
+          ->empty_tensor_restride(*memory_format_opt);
+    }
+  }
+
+  return tensor;
+}
+</code></pre>
+
+            <p>
+            The function starts with a few quiet checks. It ensures that the requested size is valid and raises a warning for certain edge cases in the scalar type. 
+            The scalar type is then translated into a lower-level representation, from which the total number of bytes required for storage is computed.
+            </p>
+
+            <p>
+            With this information, a <em>StorageImpl</em> is created using the allocator chosen earlier. 
+            This is the moment where memory is actually reserved. 
+            The storage is then wrapped inside a <em>TensorImpl</em>, along with the dispatch key set and type information, forming the core of the tensor.
+            </p>
+
+            <p>
+            The tensor’s size and memory layout are applied next. 
+            If a non-default memory format is requested, the tensor is restrided accordingly. 
+            Once this is done, the tensor is complete and ready to be returned.
+            </p>
+
+            <p>
+            This marks the end of the high-level factory path. 
+            From here onward, the story moves into the <em>c10</em> backend, where concepts like <em>TensorImpl</em>, <em>Storage</em>, allocators, and dispatch keys live in full detail.
+            </p>
+
+            <p>
+            We have followed <em>torch.empty</em> as far as it can take us without crossing that boundary. 
+            Now, if we wish to truly understand how tensors exist in PyTorch, it is time to step into the depths of the <em>c10</em> layer.
+            </p>
+
+            <code>| This is also a good moment to pause, for what follows grows deeper and more interesting still.</code>
+
+            <h2>3. c10 - The Backend</h2>
+
+            <p>We start with the allocator, because this is the first concrete decision the system makes once we cross into the c10 boundary. 
+                In <strong style="color: brown;">empty_cpu</strong>, everything that follows is downstream of how and where memory is obtained.</p>
+
+            <h4>GetCPUAllocatorMaybePinned function</h4>
+
+            <pre><code>
+c10::Allocator* GetCPUAllocatorMaybePinned(bool pin_memory) {
+  if (pin_memory) {
+    // comments are omitted for clarity
+
+    std::optional&lt;c10::DeviceType&gt; opt_device_type = std::nullopt;
+
+    if (at::globalContext().hasCUDA()) {
+      opt_device_type = c10::DeviceType::CUDA;
+    } else {
+      opt_device_type = at::getAccelerator(false);
+    }
+    if (opt_device_type.has_value()) {
+      return at::globalContext().getPinnedMemoryAllocator(opt_device_type);
+    } else {
+      TORCH_CHECK(
+          false,
+          "pin_memory=True requires a CUDA or other accelerator backend; "
+          "no pinned memory allocator is available on this system.")
+    }
+  }
+
+  return c10::GetCPUAllocator();
+}
+</code></pre>
+
+            <p>This function answers a single, practical question: which allocator should be used for a CPU tensor?</p>
+            <p>The decision hinges on the <em>pin_memory</em> flag. If pinned memory is not requested, the answer is simple. The function returns the default CPU allocator, and the story ends there.</p>
+            <p>When <em>pin_memory</em> is set to true, the path becomes more careful. Pinned memory only makes sense when an accelerator is present, since its purpose is to enable faster transfers between CPU memory and devices such as GPUs. The function therefore checks the global context to see which accelerator backends are available.</p>
+            <p>CUDA is given priority if it is present. If not, PyTorch looks for another registered accelerator. If an accelerator is found, the corresponding pinned-memory allocator is returned. If none exists, the function fails loudly, explaining that pinned memory cannot be provided on this system.</p>
+
+            <p>At this stage, nothing more than a decision has been made. 
+                This function does not allocate memory, nor does it touch any tensor data. It merely selects the allocator through which all future allocation will flow.</p>
+
+            <p>With that choice settled, the path finally reaches the point where memory is requested. The next line is where storage is created and ownership begins.</p>
+
+            <h4>Dispatch Keys</h4>
+            <p>Alongside the allocator, a second piece of information is fixed here: the dispatch key.</p>
+
+            <p>The line <em>DispatchKey::CPU</em> simply records that this tensor belongs to the CPU backend. 
+            At this stage, there is nothing subtle or dynamic about it. No kernels are chosen and no dispatch occurs. 
+            The key is stored as part of the tensor’s identity and will be consulted later, when operations are applied.</p>
+
+            <p>The mechanics behind dispatch keys are relatively straightforward, though implemented with care. 
+            Curious readers may glance at <strong style="color: brown;">c10/core/DispatchKey.h</strong> to see how these keys are defined and combined. 
+            We will return to this topic in greater detail later in the series, once the rest of the tensor machinery is firmly in place.</p>
+
+            <h4>StorageImpl</h4>
+            <pre><code>
+auto storage_impl = c10::make_intrusive&lt;StorageImpl&gt;(
+    c10::StorageImpl::use_byte_size_t(),
+    size_bytes,
+    allocator,
+    /*resizeable=*/true);
+</code></pre>
+
+            <p>Having fixed both the allocator and the dispatch key, the next and inevitable step is to look at the <em>StorageImpl</em> created inside <em>_empty_generic</em>.
+                This single line hides a short but important chain of calls that ends with a heap allocation.</p>
+
+            <pre><code>
+template &lt;class TTarget, class NullType, class... Args&gt;
+inline intrusive_ptr&lt;TTarget, NullType&gt; make_intrusive(Args&amp;&amp;... args) {
+  return intrusive_ptr&lt;TTarget, NullType&gt;::make(std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+            <p>This call does not directly construct a <em>StorageImpl</em>. 
+                Instead, it enters PyTorch’s intrusive reference-counting machinery, implemented in <strong style="color: brown;">c10/util/intrusive_ptr.h</strong>.</p>
+
+            <pre><code>
+template &lt;class... Args&gt;
+static intrusive_ptr make(Args&amp;&amp;... args) {
+  return intrusive_ptr(new TTarget(std::forward&lt;Args&gt;(args)...));
+}
+</code></pre>
+
+            <p>This function exists only to forward arguments and infer types. Here, <em>TTarget</em> becomes <em>StorageImpl</em>, and the arguments are passed through unchanged.</p>
+
+            <pre><code>
+StorageImpl* raw_ptr = new StorageImpl(
+    c10::StorageImpl::use_byte_size_t(),
+    size_bytes,
+    allocator,
+    true
+);
+</code></pre>
+
+            <p>This is the moment where the C++ object is actually created. The call to <em>new StorageImpl(...)</em> allocates the object on the heap and invokes its constructor.</p>
+
+            <p>The resulting raw pointer is immediately wrapped inside an <em>intrusive_ptr</em>.Unlike <em>std::shared_ptr</em>, the reference count lives inside the object itself.
+            This design allows PyTorch to tightly couple object lifetime, reference counting, and Python object ownership.</p>
+            <p>The remainder of <strong style="color: brown;">intrusive_ptr.h</strong> handles reference counting, weak pointers, and Python interop.
+                These details matter deeply, but they are not required to understand how storage is first created.</p>
+            
+            <p>At this point, memory ownership has begun. A <em>StorageImpl</em> object exists on the heap, bound to a chosen allocator,and managed by intrusive reference counting.</p>
+
+            <p>Next, we will examine <em>StorageImpl</em> itself: what it stores, what it owns, and how tensors are built on top of it.</p>
+
         </div>
     </article>
 </body>
