@@ -117,16 +117,10 @@
             font-weight: 600;
         }
 
-        .blog-content h3 {
-            font-size: 1.15rem;
-            margin: 2rem 0 0.75rem 0;
-            font-weight: 600;
-        }
-
         .blog-content h4 {
-            font-size: 0.95rem;
+            font-size: 1.15rem;
             margin: 2rem 0 0.5rem 0;
-            font-weight: 500;
+            font-weight: 600;
             font-family: 'Inter', system-ui;
             color: green;
             opacity: 0.85;
@@ -737,7 +731,7 @@ c10::Allocator* GetCPUAllocatorMaybePinned(bool pin_memory) {
             Curious readers may glance at <strong style="color: brown;">c10/core/DispatchKey.h</strong> to see how these keys are defined and combined. 
             We will return to this topic in greater detail later in the series, once the rest of the tensor machinery is firmly in place.</p>
 
-            <h4>StorageImpl</h4>
+            <h4>intrusive_ptr</h4>
             <pre><code>
 auto storage_impl = c10::make_intrusive&lt;StorageImpl&gt;(
     c10::StorageImpl::use_byte_size_t(),
@@ -746,48 +740,311 @@ auto storage_impl = c10::make_intrusive&lt;StorageImpl&gt;(
     /*resizeable=*/true);
 </code></pre>
 
-            <p>Having fixed both the allocator and the dispatch key, the next and inevitable step is to look at the <em>StorageImpl</em> created inside <em>_empty_generic</em>.
-                This single line hides a short but important chain of calls that ends with a heap allocation.</p>
+            <p>Having fixed both the allocator and the dispatch key, the next inevitable step is to examine the StorageImpl created inside _empty_generic. 
+                This single line conceals a short but important chain of calls that culminates in a heap allocation.</p>
 
             <pre><code>
-template &lt;class TTarget, class NullType, class... Args&gt;
 inline intrusive_ptr&lt;TTarget, NullType&gt; make_intrusive(Args&amp;&amp;... args) {
   return intrusive_ptr&lt;TTarget, NullType&gt;::make(std::forward&lt;Args&gt;(args)...);
 }
 </code></pre>
 
-            <p>This call does not directly construct a <em>StorageImpl</em>. 
-                Instead, it enters PyTorch’s intrusive reference-counting machinery, implemented in <strong style="color: brown;">c10/util/intrusive_ptr.h</strong>.</p>
+            <p>The call does not directly construct a StorageImpl. 
+                Instead, it enters PyTorch's intrusive reference-counting machinery, implemented in c10/util/intrusive_ptr.h. 
+                The make_intrusive function exists solely to forward arguments and infer types — here, TTarget becomes StorageImpl, and the constructor arguments pass through unchanged.</strong>.</p>
 
+            <p>Inside intrusive_ptr::make, the actual allocation occurs:</p>
             <pre><code>
-template &lt;class... Args&gt;
 static intrusive_ptr make(Args&amp;&amp;... args) {
   return intrusive_ptr(new TTarget(std::forward&lt;Args&gt;(args)...));
 }
 </code></pre>
 
-            <p>This function exists only to forward arguments and infer types. Here, <em>TTarget</em> becomes <em>StorageImpl</em>, and the arguments are passed through unchanged.</p>
+            <p>This is the moment the C++ object comes into existence. The new operator allocates memory on the heap and invokes the StorageImpl constructor with the forwarded arguments. The resulting raw pointer is immediately wrapped inside an intrusive_ptr.</p>
+            <p>Unlike std::shared_ptr, which stores its reference count in a separate control block, intrusive_ptr embeds the count within the object itself. This design allows PyTorch to tightly couple object lifetime with reference counting, which proves essential for Python interoperability.</p>
+            <p>The remainder of intrusive_ptr.h handles reference counting mechanics, weak pointers, and threading concerns. These details matter deeply for correctness, but they are not required to understand how storage is first created.</p>
+            <p>At this point, memory ownership has begun. A StorageImpl object exists on the heap, bound to a chosen allocator and managed by intrusive reference counting.</p>
+            <p>Next, we examine StorageImpl itself: what it stores, what it owns, and how tensors are built on top of it.</p>
+           
+            <h4>StorageImpl</h4>
 
-            <pre><code>
-StorageImpl* raw_ptr = new StorageImpl(
-    c10::StorageImpl::use_byte_size_t(),
-    size_bytes,
-    allocator,
-    true
-);
+            <p>
+If you search for the constructors of <em>StorageImpl</em> in
+<strong style="color: brown;">c10/core/StorageImpl.h</strong>, you will find two of them.
+A closer look reveals that the following constructor is the one reached from our call to <em>make_intrusive</em>.
+</p>
+
+<pre><code>
+StorageImpl(
+    use_byte_size_t /*use_byte_size*/,
+    const SymInt& size_bytes,
+    at::Allocator* allocator,
+    bool resizable)
+    : StorageImpl(
+          use_byte_size_t(),
+          size_bytes,
+          size_bytes.is_heap_allocated()
+              ? allocator->allocate(0)
+              : allocator->allocate(size_bytes.as_int_unchecked()),
+          allocator,
+          resizable) {}
 </code></pre>
 
-            <p>This is the moment where the C++ object is actually created. The call to <em>new StorageImpl(...)</em> allocates the object on the heap and invokes its constructor.</p>
+            <p>This constructor accepts exactly what was passed down from above: a tag indicating byte-based sizing, the requested size in bytes, the allocator, and a flag marking whether the storage may be resized.</p>
+            <p>Its first decision concerns the size itself. If <em>size_bytes</em> is heap-allocated, the allocator is called with zero.
+                Otherwise, the symbolic size is resolved into a concrete integer, and that value is used for allocation.</p>
+            <p>And the allocator invoked here is no stranger to us. It is the same CPU allocator selected earlier, now finally asked to provide memory.
+                This is the moment at which real storage is requested from the system.</p>
+            <p>Once allocation completes, this constructor immediately forwards the call to the primary constructor, passing along the newly created <em>DataPtr</em>.
+                That constructor performs no further allocation. It simply records the pointer, the size, and a handful of internal properties.</p>
+            <p>The chain is now complete. The call to <em>make_intrusive</em> led to <em>new StorageImpl</em>, which reached this constructor, which in turn invoked <em>allocator-&gt;allocate()</em>.
+                To understand what truly happens next, we must now step into the CPU allocator itself.</p>
 
-            <p>The resulting raw pointer is immediately wrapped inside an <em>intrusive_ptr</em>.Unlike <em>std::shared_ptr</em>, the reference count lives inside the object itself.
-            This design allows PyTorch to tightly couple object lifetime, reference counting, and Python object ownership.</p>
-            <p>The remainder of <strong style="color: brown;">intrusive_ptr.h</strong> handles reference counting, weak pointers, and Python interop.
-                These details matter deeply, but they are not required to understand how storage is first created.</p>
-            
-            <p>At this point, memory ownership has begun. A <em>StorageImpl</em> object exists on the heap, bound to a chosen allocator,and managed by intrusive reference counting.</p>
+            <h4>CPUAllocator::allocate</h4>
 
-            <p>Next, we will examine <em>StorageImpl</em> itself: what it stores, what it owns, and how tensors are built on top of it.</p>
+            <p>Before we reach the operating system itself, there is one final layer to pass through.
+            When <em>StorageImpl</em> calls <em>allocator-&gt;allocate(size_bytes)</em>, it is invoking a virtual method defined on the base <em>Allocator</em> interface.
+            Which implementation actually runs depends on the allocator we selected earlier.</p>
 
+            <p>In our case, that allocator is the default CPU allocator.
+            Concretely, this is an instance of <strong style="color: brown;">DefaultCPUAllocator</strong>, defined in
+            <em>c10/core/CPUAllocator.cpp</em>. Let us see what happens when its <em>allocate</em> method is invoked.</p>
+
+<pre><code>
+struct C10_API DefaultCPUAllocator final : at::Allocator {
+  DefaultCPUAllocator() = default;
+  
+  at::DataPtr allocate(size_t nbytes) override {
+    void* data = nullptr;
+    try {
+      data = c10::alloc_cpu(nbytes);
+    } catch (c10::Error& e) {
+      profiledCPUMemoryReporter().OutOfMemory(nbytes);
+      throw e;
+    }
+    profiledCPUMemoryReporter().New(data, nbytes);
+    return {data, data, &ReportAndDelete, at::Device(at::DeviceType::CPU)};
+  }
+</code></pre>
+
+            <p>This function is small, but it marks the boundary between PyTorch’s abstractions and the system allocator.
+                It begins by declaring a raw pointer and immediately calls <em>c10::alloc_cpu(nbytes)</em>.</p>
+
+            <p>If the allocation fails, the error is propagated upward.
+                Profiling hooks are enabled here to track allocations and failures for debugging and diagnostics, but we will not dwell on them.</p>
+
+            <p>Assuming the allocation succeeds, the pointer is wrapped and returned. We will postpone a detailed discussion of what this wrapper contains and why it exists.
+                That will be our next stop.</p>
+
+            <p>For now, let us follow the call further down, into <em>c10::alloc_cpu</em>, where memory is finally requested from the operating system.</p>
+
+            <h4>alloc_cpu</h4>
+
+            <p>Up to this point, everything we have seen lives entirely within PyTorch. Now we arrive at the edge.
+            The function <strong style="color: brown;">c10::alloc_cpu</strong>, defined in <em>c10/core/impl/alloc_cpu.cpp</em>, is where PyTorch makes the actual system call.</p>
+
+<pre><code>
+void* alloc_cpu(size_t nbytes) {
+  if (nbytes == 0) {
+    return nullptr;
+  }
+  
+  CAFFE_ENFORCE(
+      ((ptrdiff_t)nbytes) >= 0,
+      "alloc_cpu() seems to have been called with negative number: ",
+      nbytes);
+
+  void* data = nullptr;
+</code></pre>
+
+            <p>The function begins with two simple guards. If zero bytes are requested, (for empty tensors with zero elements), no memory is needed, so <em>alloc_cpu</em> simply returns <em>nullptr</em> while the tensor still carries its shape and type metadata.
+            No memory needs to be allocated. The second check ensures the size is non-negative, catching invalid requests early.</p>
+
+<pre><code>
+int err = posix_memalign(&data, c10_compute_alignment(nbytes), nbytes);
+CAFFE_ENFORCE(
+    err == 0,
+    "DefaultCPUAllocator: can't allocate memory: you tried to allocate ",
+    nbytes,
+    " bytes. Error code ",
+    err,
+    " (",
+    c10::utils::str_error(err),
+    ")");
+</code></pre>
+
+            <p>This is the moment when the operating system is asked for memory.
+                On Unix-like systems, PyTorch uses <strong style="color: brown;">posix_memalign</strong> to allocate memory with a specific alignment.
+                On Windows, PyTorch uses platform-specific APIs to request aligned memory, ensuring the same alignment guarantees as <em>posix_memalign</em> on Unix systems.</p>
+
+            <p>
+            Alignment matters for performance. Many CPU instructions and vectorized operations require data to be aligned to fixed boundaries, commonly 64 bytes.
+            The helper <em>c10_compute_alignment</em> selects an appropriate alignment based on the requested size and system configuration.</p>
+
+<pre><code>
+if (is_thp_alloc(nbytes)) {
+#ifdef __linux__
+  madvise(data, nbytes, MADV_HUGEPAGE);
+#endif
+}
+</code></pre>
+
+            <p>For sufficiently large allocations, PyTorch may advise the kernel to back this memory with transparent huge pages.
+            This is an optimization hint only. If it cannot be applied, execution continues normally.
+            </p>
+
+<pre><code>
+NUMAMove(data, nbytes, GetCurrentNUMANode());
+</code></pre>
+
+            <p>The allocator is also NUMA-aware.
+            On multi-socket systems, memory is placed on the current NUMA node so that it remains physically close to the executing CPU, reducing access latency.</p>
+
+<pre><code>
+if (FLAGS_caffe2_cpu_allocator_do_zero_fill) {
+  memset(data, 0, nbytes);
+} else if (FLAGS_caffe2_cpu_allocator_do_junk_fill) {
+  memset_junk(data, nbytes);
+}
+
+return data;
+}
+</code></pre>
+
+            <p>Finally, the memory may be initialized. Depending on configuration, it can be zero-filled or filled with a known pattern to expose bugs that rely on uninitialized data.
+                If neither mode is enabled, the memory is returned as-is.</p>
+
+            <p>At this point, the system has granted PyTorch a block of memory.
+                This raw pointer now begins its journey back upward, where it will be wrapped, stored, and eventually associated with a tensor.
+            </p>
+
+            <p>Before we return to <em>StorageImpl</em>, there is one important structure we have deliberately skipped.
+                The allocator does not return a raw pointer directly. Instead, it returns a <em>DataPtr</em>.
+                To understand how memory ownership, lifetime, and deletion are handled, we must look at <em>DataPtr</em> next.</p>
+
+            <h4>DataPtr</h4>
+
+            <p>The raw pointer returned from <em>alloc_cpu</em> is not stored directly inside <em>StorageImpl</em>. 
+            Before that happens, it is wrapped in a small but important abstraction called <strong style="color: brown;">DataPtr</strong>.</p>
+
+            <p>Back in <em>DefaultCPUAllocator::allocate</em>, once memory is successfully allocated, the allocator returns a <em>DataPtr</em> constructed like this:</p>
+
+<pre><code>
+return {data, data, &ReportAndDelete, at::Device(at::DeviceType::CPU)};
+</code></pre>
+
+            <p>This invokes one of <em>DataPtr</em>'s constructors. Let us look at its definition. </p>
+
+<pre><code>
+class C10_API DataPtr {
+private:
+  c10::detail::UniqueVoidPtr ptr_;
+  Device device_;
+
+public:
+  DataPtr(void* data, void* ctx, DeleterFnPtr ctx_deleter, Device device)
+      : ptr_(data, ctx, ctx_deleter), device_(device) {}
+};
+</code></pre>
+
+            <p>A <em>DataPtr</em> stores two things: a <em>UniqueVoidPtr</em> that owns the memory, and a <em>Device</em> that records where this memory lives.</p>
+
+            <p>The <em>data</em> argument is the actual address returned by <em>alloc_cpu</em>. 
+                This is the pointer that tensor operations will eventually read from and write to.</p>
+
+            <p>The <em>ctx</em> argument is the context pointer that will be passed to the deleter when the memory is freed. 
+                For the CPU allocator, this is simply the same pointer as <em>data</em>. More complex allocators may use a different context object to carry additional metadata.</p>
+
+            <p>The third argument is the deleter function. When the <em>DataPtr</em> is destroyed, this function will be invoked with the context pointer. 
+                In our case, it ultimately returns memory back to the system.</p>
+
+            <p>Finally, the device field records that this allocation belongs to the CPU backend.</p>
+
+            <p>Internally, ownership is handled by <em>UniqueVoidPtr</em>. This is where the lifetime rules are enforced.</p>
+
+<pre><code>
+class UniqueVoidPtr {
+private:
+  void* data_;
+  std::unique_ptr&lt;void, DeleterFnPtr&gt; ctx_;
+
+public:
+  UniqueVoidPtr(void* data, void* ctx, DeleterFnPtr ctx_deleter)
+      : data_(data), ctx_(ctx, ctx_deleter ? ctx_deleter : &deleteNothing) {}
+};
+</code></pre>
+
+            <p>The key idea here is separation. 
+                The pointer used for data access does not own the memory. Ownership instead lives with the context pointer managed by a <em>std::unique_ptr</em>.</p>
+
+            <p> This design allows PyTorch to expose one pointer to users while freeing memory using another. 
+                Although both pointers are the same for CPU allocations, this flexibility is essential for CUDA, shared memory, and externally managed buffers.</p>
+
+            <p>Once constructed, the <em>DataPtr</em> is returned to the <em>StorageImpl</em> constructor that requested it.
+                The returned <em>DataPtr</em> is immediately forwarded to the primary <em>StorageImpl</em> constructor.</p>
+
+<pre><code>
+StorageImpl(
+    use_byte_size_t /*use_byte_size*/,
+    SymInt size_bytes,
+    at::DataPtr data_ptr,
+    at::Allocator* allocator,
+    bool resizable)
+    : data_ptr_(std::move(data_ptr)),
+      size_bytes_(std::move(size_bytes)),
+      size_bytes_is_heap_allocated_(size_bytes_.is_heap_allocated()),
+      resizable_(resizable),
+      received_cuda_(false),
+      allocator_(allocator) {
+  if (resizable) {
+    TORCH_INTERNAL_ASSERT(
+        allocator_, "For resizable storage, allocator must be provided");
+  }
+  refresh_has_data_ptr_check();
+}
+</code></pre>
+
+            <p>Here, ownership is transferred into <em>StorageImpl</em> via a move. From this moment on, the storage object controls the lifetime of the memory.</p>
+            <p>When <em>StorageImpl</em> is eventually destroyed, its <em>DataPtr</em> is destroyed as well. That destruction triggers the deleter, returning the memory back to the system.</p>
+            <p>At this point, the storage layer is complete. 
+                We now have a heap-allocated <em>StorageImpl</em>, managed by an <em>intrusive_ptr</em>, holding a <em>DataPtr</em> that knows how to free its memory correctly.</p>
+
+            <p>We now return to <em>_empty_generic</em>. With what we have seen so far, the next step should no longer be a surprise.</p>
+
+            <h4>make_tensor_base</h4>
+
+            <p>With the storage layer complete, we return once more to <em>_empty_generic</em>, where the next step quietly awaits.</p>
+
+<pre><code>
+auto tensor = detail::make_tensor_base&lt;TensorImpl&gt;(
+    std::move(storage_impl), ks, dtype);
+</code></pre>
+
+            <p>This single line marks an important transition. 
+                Until now, we have been dealing only with memory: allocators, raw pointers, and storage. Here, that memory is finally lifted into the world of tensors.</p>
+
+            <p>The helper <em>make_tensor_base</em>, defined in <em>aten/src/ATen/core/TensorBase.h</em>, is intentionally small.</p>
+
+<pre><code>
+template &lt;typename T, typename... Args&gt;
+TensorBase make_tensor_base(Args&amp;&amp;... args) {
+  return TensorBase(c10::make_intrusive&lt;T&gt;(std::forward&lt;Args&gt;(args)...));
+}
+</code></pre>
+
+            <p>All it does is forward its arguments into <em>c10::make_intrusive&lt;TensorImpl&gt;</em>. 
+            Just as before with <em>StorageImpl</em>, this expands into a heap allocation:</p>
+
+            <p><em>new TensorImpl(std::move(storage_impl), ks, dtype)</em></p>
+
+            <p>The storage is moved, not copied, and ownership passes cleanly into the newly created <em>TensorImpl</em>. 
+                That <em>TensorImpl</em> is then wrapped in an <em>intrusive_ptr</em> and placed inside a <em>TensorBase</em>, which acts as the lightweight handle exposed throughout PyTorch.</p>
+
+            <p>At this point, we stop. We now know <em>where</em> <em>TensorImpl</em> comes from and <em>how</em> it is constructed, but not yet <em>what</em> it does.</p>
+
+            <p> To truly understand how a tensor gains its shape, strides, and behavior, we must step into the <em>TensorImpl</em> constructor itself. That is where the next phase begins.</p>
+
+            <h4>TensorImpl</h4>
         </div>
     </article>
 </body>
