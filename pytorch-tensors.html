@@ -1045,6 +1045,105 @@ TensorBase make_tensor_base(Args&amp;&amp;... args) {
             <p> To truly understand how a tensor gains its shape, strides, and behavior, we must step into the <em>TensorImpl</em> constructor itself. That is where the next phase begins.</p>
 
             <h4>TensorImpl</h4>
+
+            <p>We have seen how <em>make_intrusive</em> allocates a <em>TensorImpl</em> on the heap. 
+                Now we turn our attention to what happens inside its constructor, where storage, dispatch keys, and data type finally come together to form the core of a tensor.</p>
+
+            <p>The call from <em>make_tensor_base</em> lands here, in <em>c10/core/TensorImpl.cpp</em>:</p>
+
+<pre><code>
+TensorImpl::TensorImpl(
+    Storage&& storage,
+    DispatchKeySet key_set,
+    const caffe2::TypeMeta data_type)
+    : TensorImpl(std::move(storage), key_set, data_type, storage.device()) {}
+</code></pre>
+
+            <p>This constructor is deliberately minimal. 
+                It immediately forwards to a more complete constructor, extracting the device from the storage and passing it along. 
+                This ensures that all <em>TensorImpl</em> instances are initialized through a single, consistent path.</p>
+
+            <p>The real work happens here:</p>
+
+<pre><code>
+TensorImpl::TensorImpl(
+    ImplType /*type*/,
+    Storage&& storage,
+    DispatchKeySet key_set,
+    const caffe2::TypeMeta data_type)
+    : storage_(std::move(storage)),
+      numel_(0),
+      data_type_(data_type),
+      device_opt_(storage_.device()),
+      key_set_(key_set - c10::python_ks) {
+  init_bitfields();
+  if (!is_inference()) {
+    version_counter_ = VariableVersion(/*version=*/0);
+  }
+}
+</code></pre>
+
+            <p>The constructor begins by moving the storage into the <em>storage_</em> member. 
+                Ownership transfers here. From this moment on, the <em>TensorImpl</em> owns the <em>StorageImpl</em>, which in turn owns the underlying memory.</p>
+
+            <p>The <em>numel_</em> field is initialized to zero. 
+                Although the tensor does have a size, that information has not yet been applied at this stage. 
+                Sizes and strides are assigned immediately after construction, at which point <em>numel_</em> will be computed correctly.</p>
+
+            <p>The <em>data_type_</em> field records the scalar type of the tensor. 
+                This value originated earlier in <em>_empty_generic</em> and is now permanently associated with the tensor.</p>
+
+            <p>The <em>device_opt_</em> field is derived directly from the storage. 
+                This guarantees that the tensor’s device always matches the device on which its memory was allocated.</p>
+
+            <p>The <em>key_set_</em> stores the dispatch keys we saw earlier when the CPU dispatch key was constructed. 
+                Here, one adjustment is made: Python-related keys are removed. At this point, the tensor exists purely on the C++ side. 
+                If and when it is exposed to Python, those keys will be added back later.</p>
+
+            <p>Next, <em>init_bitfields()</em> initializes a set of internal flags that describe tensor properties such as contiguity and metadata mutability. 
+                These flags start in sensible default states and will be refined as the tensor’s layout is finalized.</p>
+
+            <p>Finally, if the tensor participates in autograd, a version counter is created and initialized to zero. 
+                This counter allows PyTorch to track in-place mutations and enforce correctness during gradient computation.</p>
+
+            <p>At this stage, the <em>TensorImpl</em> is structurally complete. It owns storage, knows its data type, device, and dispatch keys, and is ready to describe a tensor.</p>
+
+            <p>What remains is the final step: assigning sizes and strides. 
+                That happens immediately after construction, back in <em>_empty_generic</em>. Once that is done, the tensor is fully formed and ready for use.</p>
+
+            
+            <h4>Shapes and Strides</h4> 
+            <p> With the <em>TensorImpl</em> constructed, we return once more to <em>_empty_generic</em>, where the final pieces are put in place. 
+                At this stage, memory has already been allocated and wrapped in storage, but the tensor still does not know its shape or how its elements should be laid out. </p> 
+<pre><code> 
+if (ks.has(c10::DispatchKey::Meta) || size.size() != 1 || size[0] != 0) { 
+    tensor.unsafeGetTensorImpl() 
+    ->generic_set_sizes_contiguous(size); 
+} 
+
+if (memory_format_opt.has_value()) { 
+    if (*memory_format_opt != MemoryFormat::Contiguous) { 
+        tensor.unsafeGetTensorImpl() 
+        ->empty_tensor_restride(*memory_format_opt); 
+    } 
+} 
+</code></pre>
+
+            <p> This is the point where sizes and strides are attached to the tensor. 
+                The call to <em>generic_set_sizes_contiguous</em> records the tensor’s shape and computes a matching contiguous stride layout. 
+                Only metadata is updated here. No memory is allocated, resized, or moved. </p> 
+            <p> Internally, PyTorch distinguishes between two cases. If the sizes are concrete integers, the fast path is taken and strides are computed directly. 
+                If the sizes are symbolic, PyTorch records symbolic size and stride information instead, deferring concrete values until they are known. 
+                Both paths ultimately establish the same logical view of the tensor. </p> 
+            <p> The second block handles memory format. If a non-contiguous format such as <em>channels_last</em> is requested, the tensor is restrided accordingly. 
+                Again, this affects only metadata. The underlying storage remains unchanged. </p> 
+            <p> This machinery lives in <em>c10/core/TensorImpl.cpp</em> and quickly branches into symbolic shape handling, stride policies, and layout-specific logic. 
+                Each of these deserves a careful and separate treatment. </p> 
+            <p>For <em>torch.empty</em>, shapes and strides are attached immediately after allocation, using a contiguous layout by default, with no data initialization and no further memory movement.</p>
+            <p> For our purposes, it is enough to understand the boundary: storage provides raw memory, while <em>TensorImpl</em> provides meaning. Shapes and strides complete that meaning, turning an anonymous block of bytes into a usable tensor. </p> 
+            <p> We will stop here and not descend further into symbolic shapes and stride internals. 
+                That path is deep, subtle, and worthy of its own focused write-up. </p>
+
         </div>
     </article>
 </body>
